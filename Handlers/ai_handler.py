@@ -1,0 +1,823 @@
+import os
+import sys
+import json
+import time
+import base64
+import glob
+import re
+import shutil
+import asyncio
+import subprocess
+from Hardware.Utils import edge_state
+try:
+    import requests
+except ImportError:
+    requests = None
+from Hardware.Computer_Vision.classic_cv_edit import classic_cv_editor
+from Hardware.Computer_Vision import image_scale
+
+LOCAL_TMP_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tmp_images"))
+if not os.path.exists(LOCAL_TMP_DIR):
+    os.makedirs(LOCAL_TMP_DIR)
+
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_QM_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
+                                      "Computer_Vision", "Quantize_model"))
+
+# Host publik VPS untuk mengunduh tile yang tidak ada di memori lokal Edge
+# (mode "Input Images"). Diturunkan dari VPS_BASE_URL (".../api/dataset").
+_VPS_BASE = os.getenv("VPS_BASE_URL", "http://localhost:8000/api/dataset")
+VPS_STATIC_HOST = _VPS_BASE.split("/api/")[0] if "/api/" in _VPS_BASE else _VPS_BASE.rstrip("/")
+
+# Pilihan model stitching (dari frontend) -> (script standalone, nama file hasil
+# yang ditulis script itu ke dalam folder --path).
+_STITCH_SCRIPTS = {
+    "sp_lg_tensorrt": ("SP_LG.py",      "result_sp_lg_tensorrt.jpg"),
+    "sift_bfm":       ("SIFT_BFM.py",   "result_sift_bfm.jpg"),
+    "sift_lg":        ("SIFT_LG.py",    "result_sift_lg.jpg"),
+    "brute_force":    ("brute_force.py", "result_brute_force.jpg"),
+}
+
+# Grid besar: di atas ambang ini, tile dikecilkan dulu supaya panorama muat RAM
+# Jetson (canvas keluaran ~ jumlah_tile, di 680 tile bisa OOM). Bisa disetel
+# lewat env STITCH_BIG_TILES / STITCH_BIG_SCALE.
+_STITCH_BIG_TILES = int(os.getenv("STITCH_BIG_TILES", "560"))
+_STITCH_BIG_SCALE = float(os.getenv("STITCH_BIG_SCALE", "0.6"))
+
+
+def _downscale_dir(src_dir, dst_dir, scale):
+    """Salin semua tile dari src_dir ke dst_dir dengan ukuran diperkecil `scale`.
+    Nama berkas dipertahankan (pola tile_r_c dikenali pipeline)."""
+    import cv2
+    if os.path.exists(dst_dir):
+        shutil.rmtree(dst_dir)
+    os.makedirs(dst_dir)
+    n = 0
+    for f in sorted(os.listdir(src_dir)):
+        if not f.lower().endswith((".jpg", ".jpeg", ".png")):
+            continue
+        img = cv2.imread(os.path.join(src_dir, f))
+        if img is None:
+            continue
+        h, w = img.shape[:2]
+        small = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))),
+                           interpolation=cv2.INTER_AREA)
+        cv2.imwrite(os.path.join(dst_dir, f), small, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        n += 1
+    return n
+
+
+# Penanda di stdout pipeline -> (persen, label) untuk event STITCH_PROGRESS.
+_STITCH_MILESTONES = [
+    ("gambar dimuat",   25, "Memuat tile & menyusun grid"),
+    ("Dimensi Grid",    32, "Menghitung zona overlap"),
+    ("Reference image", 62, "Menautkan tile (feature matching)"),
+    ("Reachable",       74, "Menghitung transformasi global"),
+    ("blending",        86, "Feather blending"),
+    ("Saved:",          96, "Menyimpan hasil"),
+]
+
+# Bobot YOLO segmentation TensorRT (FP16, besttt, imgsz 1280) untuk perhitungan
+# koloni -- lihat Quantize_model/Weights/yolo_model/. Diganti dari
+# best_Seg_1280_int8.engine (2026-11-18): mask mAP50-95 0.623 vs 0.223 pada
+# test set asli. Engine dibangun di Jetson ini (TensorRT 10.3); rebuild bila
+# JetPack/TensorRT berubah (test_folder/test folder/model/besttt/export_engines.py).
+# .engine tidak menyimpan metadata task seperti .pt, jadi task='segment' selalu
+# di-pass eksplisit di bawah.
+COLONY_SCRIPT = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "..", "Computer_Vision", "Quantize_model", "colony_counting.py"
+))
+COLONY_TIMEOUT_S = 300
+YOLO_SEG_MODEL = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "..", "Computer_Vision", "Quantize_model",
+    "Weights", "yolo_model", "besttt_FP16.engine"
+))
+
+# Pola nama file hasil capture tile: "<prefix>_<timestamp>_X<x>_Y<y>.jpg"
+# (lihat Devices/camera.py -> save_snapshot / Handlers/camera_handler.py
+# mock fallback), dengan '.' pada koordinat diganti '_'.
+_COORD_PAT = re.compile(r'_X(-?\d+(?:_\d+)?)_Y(-?\d+(?:_\d+)?)\.jpg$', re.IGNORECASE)
+
+
+def _parse_coord_token(token):
+    """'1_5' -> 1.5, '-2' -> -2.0 (kebalikan dari str(coord).replace('.','_'))."""
+    if '_' in token:
+        int_part, frac_part = token.split('_', 1)
+        return float(f"{int_part}.{frac_part}")
+    return float(token)
+
+
+def _fmt_coord(v):
+    """Angka -> string yang cocok regex SP_LG 'Focused_(-?\\d+(?:\\.\\d+)?)'
+    (tanpa notasi ilmiah, tanpa trailing nol)."""
+    s = f"{round(float(v), 3):.3f}".rstrip("0").rstrip(".")
+    return s if s not in ("", "-") else "0"
+
+
+def _safe_session(s):
+    """ID sesi -> nama folder aman (samakan dengan Handlers/camera_handler.py)."""
+    return re.sub(r"[^A-Za-z0-9_-]", "", str(s))[:40] or "adhoc"
+
+
+def _resolve_tile_source(t, session=None):
+    """Kembalikan path lokal ke gambar tile. Urutan:
+    (a) tmp_images/<session>/tile_r<gy>_c<gx>.jpg  (grid scan -> satu-satunya salinan lokal)
+    (b) tmp_images/<filename>                       (kompat file flat lama)
+    (c) unduh dari URL publik VPS                   ('Input Images' database/upload)."""
+    t = t or {}
+    fname = t.get("filename")
+    fname = os.path.basename(str(fname)) if fname else None
+    gx, gy = t.get("gridX"), t.get("gridY")
+
+    if session and gx is not None and gy is not None:
+        try:
+            p = os.path.join(LOCAL_TMP_DIR, _safe_session(session),
+                             f"tile_r{int(gy)}_c{int(gx)}.jpg")
+            if os.path.exists(p):
+                return p
+        except (TypeError, ValueError):
+            pass
+
+    if fname:
+        local = os.path.join(LOCAL_TMP_DIR, fname)
+        if os.path.exists(local):
+            return local
+    url = t.get("url")
+    if url and requests is not None:
+        if url.startswith("/"):
+            url = VPS_STATIC_HOST + url
+        try:
+            dl_dir = os.path.join(LOCAL_TMP_DIR, "_stitch_dl")
+            os.makedirs(dl_dir, exist_ok=True)
+            dst = os.path.join(dl_dir, fname or os.path.basename(url))
+            with requests.get(url, stream=True, timeout=30) as rq:
+                if rq.status_code == 200:
+                    with open(dst, "wb") as f:
+                        for chunk in rq.iter_content(8192):
+                            if chunk:
+                                f.write(chunk)
+                    return dst
+                print(f"[BRIDGE AI WARNING] Unduh tile gagal ({rq.status_code}): {url}")
+        except Exception as e:
+            print(f"[BRIDGE AI WARNING] Unduh tile error: {e}")
+    return None
+
+
+def _stage_tiles_from_coords(tiles, stage_dir, session=None):
+    """Stage tile memakai info eksplisit dari backend. Prioritas nama:
+    'tile_r<row>_c<col>.jpg' (indeks grid) kalau ada gridX/gridY, kalau tidak
+    'Focused_<x>_<y>.jpg' (koordinat mm). Keduanya dikenali SP_LG.load_image()."""
+    if os.path.exists(stage_dir):
+        shutil.rmtree(stage_dir)
+    os.makedirs(stage_dir)
+
+    staged = 0
+    for t in tiles:
+        t = t or {}
+        gx, gy = t.get("gridX"), t.get("gridY")
+        x, y = t.get("coordX"), t.get("coordY")
+
+        if gx is not None and gy is not None and int(gx) >= 0 and int(gy) >= 0:
+            dst_name = f"tile_r{int(gy)}_c{int(gx)}.jpg"
+        elif x is not None and y is not None:
+            dst_name = f"Focused_{_fmt_coord(x)}_{_fmt_coord(y)}.jpg"
+        else:
+            print(f"[BRIDGE AI WARNING] Tile tanpa posisi grid/koordinat: {t}")
+            continue
+
+        src = _resolve_tile_source(t, session=session)
+        if not src:
+            print(f"[BRIDGE AI WARNING] Sumber tile tidak tersedia: {t.get('filename')}")
+            continue
+        shutil.copy2(src, os.path.join(stage_dir, dst_name))
+        staged += 1
+    return staged
+
+
+def _stage_tiles_for_sp_lg(image_paths, stage_dir):
+    """
+    SP_LG.load_image() hanya mengenali nama file 'Focused_<x>_<y>.jpg' atau
+    'tile_r<row>_c<col>.jpg' untuk merekonstruksi grid. Tile hasil capture
+    disimpan dengan pola '..._X<x>_Y<y>.jpg', jadi di-copy (bukan di-move,
+    agar file asli di LOCAL_TMP_DIR tetap ada) ke folder staging sementara
+    dengan nama yang dikenali sebelum pipeline SP_LG dijalankan.
+    """
+    if os.path.exists(stage_dir):
+        shutil.rmtree(stage_dir)
+    os.makedirs(stage_dir)
+
+    staged = 0
+    for path in image_paths:
+        fname = os.path.basename(path)
+        m = _COORD_PAT.search(fname)
+        if not m or not os.path.exists(path):
+            print(f"[BRIDGE AI WARNING] Lewati tile tanpa koordinat X/Y valid: {fname}")
+            continue
+        x, y = _parse_coord_token(m.group(1)), _parse_coord_token(m.group(2))
+        shutil.copy2(path, os.path.join(stage_dir, f"Focused_{x}_{y}.jpg"))
+        staged += 1
+    return staged
+
+
+def _run_colony_count(input_path, output_dir, conf=0.25, um_per_px=None):
+    """
+    Jalankan model YOLO segmentation nyata (YOLO_SEG_MODEL = besttt_FP16.engine) lewat
+    colony_counting.count_colonies(), lalu salin hasil anotasinya ke nama
+    lama 'yolo_<original>.jpg' supaya kontrak filename yang sudah dipakai
+    downstream (event WebSocket, file JSON di static/uploads) tetap sama.
+    Return (legacy_filename, count, result) -- result = JSON lengkap dari
+    colony_counting (area_stats, histogram_path, areas_csv_path, ...).
+    um_per_px=(x, y) menimpa skala; default: skala tertanam di JPEG / FOV tile.
+    """
+    # Proses terpisah, sama seperti stitching: kehabisan memori GPU di TensorRT mematikan
+    # proses secara langsung tanpa exception Python. Di proses utama, itu berarti koneksi
+    # VPS, kamera, dan motor ikut mati. Memori GPU juga kembali bebas setelah selesai.
+    os.makedirs(output_dir, exist_ok=True)
+    cmd = [sys.executable, "-u", COLONY_SCRIPT, "--image", input_path, "--model", YOLO_SEG_MODEL,
+           "--output-dir", output_dir, "--conf", str(conf), "--task", "segment"]
+    if um_per_px:
+        cmd += ["--um-per-px"] + [str(v) for v in um_per_px]
+    for attempt in range(2):
+        done = subprocess.run(cmd, capture_output=True, text=True, timeout=COLONY_TIMEOUT_S)
+        oom = done.returncode != 0 and ("out of memory" in (done.stdout + done.stderr).lower()
+                                         or "NVML_SUCCESS" in done.stderr)
+        if not oom or attempt:
+            break
+        # OOM GPU di Jetson sering sesaat (memori dibagi dgn CPU); coba sekali lagi.
+        print("[BRIDGE AI] Colony counting kehabisan memori GPU — mencoba ulang dalam 5 dtk")
+        time.sleep(5)
+    if done.returncode != 0:
+        tail = " ".join((done.stderr or done.stdout).strip().splitlines()[-3:])
+        if "out of memory" in (done.stdout + done.stderr).lower() or "NVML_SUCCESS" in done.stderr:
+            tail = "Memori GPU Jetson tidak cukup. Tutup aplikasi lain lalu coba lagi. " + tail
+        raise RuntimeError(f"Colony counting gagal (rc={done.returncode}): {tail[-400:]}")
+    stem = os.path.splitext(os.path.basename(input_path))[0]
+    with open(os.path.join(output_dir, f"{stem}_colonies.json")) as f:
+        result = json.load(f)
+
+    legacy_filename = "yolo_" + os.path.basename(input_path)
+    legacy_path = os.path.join(output_dir, legacy_filename)
+    if result["annotated_path"] and os.path.abspath(result["annotated_path"]) != os.path.abspath(legacy_path):
+        shutil.copy2(result["annotated_path"], legacy_path)
+
+    return legacy_filename, result["count"], result
+
+
+def _colony_area_payload(result, report_name):
+    """Field tambahan CV_RESULT untuk luas koloni: statistik ringkas + histogram
+    PNG dan CSV per-koloni (base64/teks) dengan nama turunan dari report_name."""
+    stats = result.get("area_stats") or {}
+    out = {"area": {k: stats.get(k) for k in (
+        "unit", "length_unit", "n", "calibrated", "scale", "total", "mean", "median", "std",
+        "min", "max", "p10", "p90", "mean_eq_diameter", "hist_counts", "hist_edges")}}
+    stem = os.path.splitext(os.path.basename(report_name))[0]
+    hist = result.get("histogram_path")
+    if hist and os.path.exists(hist):
+        with open(hist, "rb") as f:
+            out["histogram_data"] = "data:image/png;base64," + base64.b64encode(f.read()).decode("utf-8")
+        out["histogram_filename"] = f"{stem}_area_hist.png"
+    csv_path = result.get("areas_csv_path")
+    if csv_path and os.path.exists(csv_path):
+        with open(csv_path, encoding="utf-8") as f:
+            out["areas_csv"] = f.read()
+        out["areas_csv_filename"] = f"{stem}_areas.csv"
+    return out
+
+
+def _morphology_stats(result):
+    """Statistik morfologi dari koloni hasil segmentasi YOLO (colony_counting).
+    Kunci total_cells/avg_area/avg_perimeter/total_area dipertahankan supaya
+    panel UI lama tetap terisi; satuan ikut kalibrasi (mm²/mm atau px²/px)."""
+    st = result.get("area_stats") or {}
+    cols = result.get("colonies") or []
+
+    def mean(key):
+        vals = [c[key] for c in cols if isinstance(c.get(key), (int, float))]
+        return sum(vals) / len(vals) if vals else 0.0
+
+    r = (lambda v: round(float(v or 0.0), 6))
+    return {
+        "method": f"YOLO segmentation ({os.path.basename(YOLO_SEG_MODEL)})",
+        "unit": st.get("unit", "px²"),
+        "length_unit": st.get("length_unit", "px"),
+        "calibrated": bool(st.get("calibrated")),
+        "total_cells": int(st.get("n") or 0),
+        "total_area": r(st.get("total")),
+        "avg_area": r(st.get("mean")),
+        "median_area": r(st.get("median")),
+        "avg_perimeter": r(mean("perimeter")),
+        "avg_eq_diameter": r(mean("eq_diameter")),
+        "avg_circularity": round(mean("circularity"), 4),
+        "mask_mode": result.get("mask_mode", "full"),
+    }
+
+
+def _script_resize_factor(script_path):
+    """CONFIG['resize_factor'] dari skrip stitching (dibaca dari sumbernya
+    supaya selalu sinkron dengan nilai yang benar-benar dipakai)."""
+    try:
+        with open(script_path, encoding="utf-8") as f:
+            m = re.search(r"['\"]resize_factor['\"]\s*:\s*([0-9.]+)", f.read())
+        return float(m.group(1)) if m else 1.0
+    except (OSError, ValueError):
+        return 1.0
+
+
+def _first_tile_name(folder):
+    """Nama tile pertama di folder -- BUKAN hasil stitching. Skrip stitching
+    menulis result_<metode>.jpg ke folder yang sama dengan tile, dan nama itu
+    terurut sebelum tile_r0_c0.jpg; kalau ikut terbaca, skala panorama dihitung
+    dari ukuran panorama sendiri (bug 2026-11-19: 3.05 µm/px, seharusnya ~9.8)."""
+    names = sorted(f for f in os.listdir(folder)
+                   if f.lower().endswith((".jpg", ".jpeg", ".png"))
+                   and not f.lower().startswith(("result", "stitched")))
+    tiles = [f for f in names if re.match(r"tile_r\d+_c\d+\.", f, re.IGNORECASE)]
+    return (tiles or names or [None])[0]
+
+
+def _image_dims(path):
+    import cv2
+    img = cv2.imread(path) if path and os.path.exists(path) else None
+    return (img.shape[1], img.shape[0]) if img is not None else None
+
+
+def _tag_panorama_scale(pano_path, stage_dir, run_dir, script_path, model_key):
+    """Tanam µm/px panorama ke JPEG-nya. Skala = µm/px tile asli (FOV kamera /
+    dimensi tile) dibagi faktor pengecilan total: pra-skala grid besar/OOM
+    (run_dir vs stage_dir) x CONFIG['resize_factor'] skrip. Tile yang bukan
+    frame kamera (rasio aspek lain) -> tidak ditandai (luas tetap px²)."""
+    try:
+        name = _first_tile_name(stage_dir)          # dibandingkan file tile yang SAMA
+        if not name:
+            return None
+        orig = _image_dims(os.path.join(stage_dir, name))
+        used = _image_dims(os.path.join(run_dir, name)) if run_dir != stage_dir else orig
+        if not orig or not used:
+            return None
+        tile = image_scale.tile_scale_for_dims(*orig)
+        if not tile:
+            print(f"[BRIDGE AI] Tile {orig[0]}x{orig[1]} bukan frame kamera — skala panorama tidak ditandai.")
+            return None
+        factor = (used[0] / orig[0]) * _script_resize_factor(script_path)
+        sx, sy = tile[0] / factor, tile[1] / factor
+        image_scale.write_scale(pano_path, sx, sy,
+                                f"stitch {model_key}: tile {orig[0]}x{orig[1]} x{factor:.3g}")
+        print(f"[BRIDGE AI] Skala panorama: {sx:.3f} x {sy:.3f} µm/px (faktor {factor:.3g})")
+        return sx, sy
+    except Exception as e:
+        print(f"[BRIDGE AI] Gagal menandai skala panorama: {e}")
+        return None
+
+
+# =====================================================================
+# Image Analysis (CV_*) — SEMUA dieksekusi DI JETSON, hasil dikirim balik
+# ke VPS sebagai base64 lewat WebSocket (event CV_RESULT / CV_FAILED).
+# Tidak ada ketergantungan filesystem bersama dengan VPS.
+# =====================================================================
+_CV_IN_DIR = os.path.join(LOCAL_TMP_DIR, "_cv_in")
+
+
+def _fetch_analysis_input(filename, image_b64=None):
+    """Path lokal ke gambar input analisis di Jetson. Urutan:
+    (a) base64 dari payload perintah, (b) sudah ada di tmp_images,
+    (c) unduh dari VPS <host>/static/uploads/<filename>."""
+    if not filename:
+        return None
+    base = os.path.basename(str(filename))
+
+    if image_b64:
+        try:
+            os.makedirs(_CV_IN_DIR, exist_ok=True)
+            payload = image_b64.split(",", 1)[1] if "," in image_b64 else image_b64
+            dst = os.path.join(_CV_IN_DIR, base)
+            with open(dst, "wb") as f:
+                f.write(base64.b64decode(payload))
+            return dst
+        except Exception as e:
+            print(f"[BRIDGE CV] Gagal decode base64 input: {e}")
+
+    local = os.path.join(LOCAL_TMP_DIR, base)
+    if os.path.exists(local):
+        return local
+
+    if requests is not None:
+        url = f"{VPS_STATIC_HOST}/static/uploads/{filename}"
+        try:
+            os.makedirs(_CV_IN_DIR, exist_ok=True)
+            dst = os.path.join(_CV_IN_DIR, base)
+            with requests.get(url, stream=True, timeout=30) as rq:
+                if rq.status_code == 200:
+                    with open(dst, "wb") as f:
+                        for chunk in rq.iter_content(8192):
+                            if chunk:
+                                f.write(chunk)
+                    return dst
+                print(f"[BRIDGE CV] Unduh input gagal ({rq.status_code}): {url}")
+        except Exception as e:
+            print(f"[BRIDGE CV] Unduh input error: {e}")
+    return None
+
+
+async def _send_cv_result(websocket, ws_lock, out_path, report_name, extra=None):
+    with open(out_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("utf-8")
+    msg = {
+        "event": "CV_RESULT", "status": "SUCCESS",
+        "filename": report_name,
+        "image_data": f"data:image/jpeg;base64,{b64}",
+    }
+    if extra:
+        msg.update(extra)
+    async with ws_lock:
+        await websocket.send(json.dumps(msg))
+
+
+async def _send_cv_failed(websocket, ws_lock, tool, detail, output_name=None):
+    print(f"[BRIDGE CV ERROR] {tool}: {detail}")
+    async with ws_lock:
+        await websocket.send(json.dumps({
+            "event": "CV_FAILED", "status": "ERROR", "tool": tool,
+            "detail": detail, "output_name": output_name,
+        }))
+
+
+# tool CV_* -> (method callable pada classic_cv_editor, apakah mengembalikan (name, extra))
+_CV_CLASSIC = {
+    "CV_THRESHOLD":   ("apply_adaptive_threshold", None),
+    "CV_CONTOUR":     ("extract_and_draw_contours", None),
+    "CV_SOBEL":       ("apply_sobel_edge", None),
+    "CV_ROI":         ("auto_roi_crop", None),
+    "CV_CALIBRATE":   ("draw_scale_calibration", None),
+    "CV_COLOR_SPLIT": ("split_color_channels", None),
+    "CV_MORPHOLOGY":  ("calculate_morphology", "stats"),
+}
+
+
+_stitch_task = None  # ref agar task background tidak di-GC
+
+
+async def _pause_edge_for_stitch(state):
+    """Bebaskan RAM/CPU sebelum subprocess stitching berat: matikan stream,
+    tutup pipeline kamera (nvarguscamerasrc menahan ratusan MB), rem syncer &
+    telemetri lewat edge_state.stitching."""
+    edge_state.stream_was_on = bool(state.get("is_streaming")) if isinstance(state, dict) else False
+    if isinstance(state, dict):
+        state["is_streaming"] = False
+    edge_state.stitching = True
+    try:
+        await asyncio.to_thread(camera_core.close)
+        print("[BRIDGE AI] Kamera ditutup sementara untuk memberi ruang RAM stitching.")
+    except Exception as e:
+        print(f"[BRIDGE AI] (info) gagal menutup kamera: {e}")
+    await asyncio.sleep(0.8)
+
+
+async def _resume_edge_after_stitch(state):
+    edge_state.stitching = False
+    try:
+        await asyncio.to_thread(camera_core.open)
+        print("[BRIDGE AI] Kamera dibuka kembali setelah stitching.")
+    except Exception as e:
+        print(f"[BRIDGE AI] (info) gagal membuka kamera lagi: {e}")
+    if isinstance(state, dict):
+        state["is_streaming"] = edge_state.stream_was_on
+
+
+async def _run_stitch_job(data, websocket, ws_lock, state):
+    """Seluruh proses tile stitching, DIJALANKAN SEBAGAI TASK BACKGROUND supaya
+    receive_handler tetap responsif. Dijamin selalu mengirim STITCHING_COMPLETE
+    atau STITCHING_FAILED — tidak pernah melempar exception ke pemanggil."""
+    model_key = (data.get("model") or "sp_lg_tensorrt").lower()
+    if model_key not in _STITCH_SCRIPTS:
+        model_key = "sp_lg_tensorrt"
+    session = data.get("session")
+    print(f"[BRIDGE AI] Tile Stitching (model={model_key}, sesi={session}) — mulai.")
+
+    async def emit_progress(pct, label):
+        try:
+            async with ws_lock:
+                await websocket.send(json.dumps({
+                    "event": "STITCH_PROGRESS", "pct": int(pct), "phase": label,
+                }))
+        except Exception:
+            pass
+
+    async def emit_failed(detail):
+        print(f"[BRIDGE AI ERROR] Stitching gagal: {detail}")
+        try:
+            async with ws_lock:
+                await websocket.send(json.dumps({
+                    "event": "STITCHING_FAILED", "status": "ERROR",
+                    "detail": detail or "Stitching gagal di Edge Device.",
+                }))
+        except Exception:
+            pass
+
+    paused = False
+    try:
+        await emit_progress(5, "Menyiapkan tile")
+
+        tiles = data.get("tiles")
+        stage_dir = None
+        staged = 0
+
+        if session:
+            sess_dir = os.path.join(LOCAL_TMP_DIR, _safe_session(session))
+            grid_files = glob.glob(os.path.join(sess_dir, "tile_r*_c*.jpg"))
+            if os.path.isdir(sess_dir) and len(grid_files) >= 2:
+                stage_dir = sess_dir
+                staged = len(grid_files)
+                print(f"[BRIDGE AI] Memakai folder sesi ({staged} tile): {sess_dir}")
+
+        if stage_dir is None:
+            stage_dir = os.path.join(LOCAL_TMP_DIR, "_stage_" + _safe_session(session or "adhoc"))
+            if tiles:
+                staged = _stage_tiles_from_coords(tiles, stage_dir, session=session)
+            elif data.get("images"):
+                captured_tiles = [os.path.join(LOCAL_TMP_DIR, img) for img in data["images"]]
+                staged = _stage_tiles_for_sp_lg(captured_tiles, stage_dir)
+            else:
+                staged = 0
+
+        if staged < 2:
+            await emit_failed(f"Tile dengan posisi valid kurang dari 2 (staged={staged}).")
+            return
+
+        await emit_progress(10, f"Menyiapkan {staged} tile")
+
+        # Bebaskan RAM sebelum subprocess (fork main.py butuh ruang sebesar RSS-nya).
+        await _pause_edge_for_stitch(state)
+        paused = True
+
+        script, result_name = _STITCH_SCRIPTS[model_key]
+        script_path = os.path.join(_QM_DIR, script)
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join([_REPO_ROOT, _QM_DIR, env.get("PYTHONPATH", "")])
+        scaled_dir = os.path.join(LOCAL_TMP_DIR, "_stage_scaled_" + _safe_session(session or "adhoc"))
+        t0 = time.time()
+
+        async def run_pipeline(run_dir):
+            """Jalankan pipeline sekali di run_dir. Return (rc, err_tail, expected_path)."""
+            exp = os.path.join(run_dir, result_name)
+            if os.path.exists(exp):
+                os.remove(exp)
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    sys.executable, "-u", script_path, "--path", run_dir,
+                    cwd=_QM_DIR, env=env,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                )
+            except OSError as e:
+                return None, [f"OSError: {e}"], exp
+            err_tail, seen, cur = [], set(), 14
+
+            async def drain_stderr():
+                try:
+                    while True:
+                        ln = await proc.stderr.readline()
+                        if not ln:
+                            break
+                        s = ln.decode("utf-8", "replace").rstrip()
+                        if s:
+                            err_tail.append(s)
+                            if len(err_tail) > 14:
+                                err_tail.pop(0)
+                            print(f"[STITCH:{model_key}:err] {s}")
+                except Exception:
+                    pass
+            stderr_task = asyncio.create_task(drain_stderr())
+            while True:
+                try:
+                    raw = await asyncio.wait_for(proc.stdout.readline(), timeout=15)
+                except asyncio.TimeoutError:
+                    el = int(time.time() - t0)
+                    cur = min(96, cur + 1)
+                    await emit_progress(cur, f"Memproses… (t={el}s)")
+                    if proc.returncode is not None:
+                        break
+                    continue
+                if not raw:
+                    break
+                line = raw.decode("utf-8", "replace").rstrip()
+                if line:
+                    print(f"[STITCH:{model_key}] {line}")
+                for key, pct, label in _STITCH_MILESTONES:
+                    if key in line and key not in seen:
+                        seen.add(key)
+                        cur = max(cur, pct)
+                        await emit_progress(cur, label)
+            rc_ = await proc.wait()
+            try:
+                await asyncio.wait_for(stderr_task, timeout=2)
+            except Exception:
+                stderr_task.cancel()
+            return rc_, err_tail, exp
+
+        # Grid sangat besar -> kecilkan tile lebih dulu supaya panorama muat RAM.
+        run_dir = stage_dir
+        note = ""
+        if staged > _STITCH_BIG_TILES:
+            await emit_progress(11, f"{staged} tile — mengecilkan ke {int(_STITCH_BIG_SCALE*100)}% agar muat RAM")
+            n = await asyncio.to_thread(_downscale_dir, stage_dir, scaled_dir, _STITCH_BIG_SCALE)
+            if n >= 2:
+                run_dir, staged = scaled_dir, n
+                note = f" (skala {int(_STITCH_BIG_SCALE*100)}%)"
+
+        await emit_progress(14, f"Menjalankan {model_key} — {staged} tile{note}")
+        rc, err_tail, expected = await run_pipeline(run_dir)
+
+        # OOM (SIGKILL) dan belum di-scale -> coba ulang sekali pada skala kecil.
+        if rc in (-9, 137) and run_dir == stage_dir:
+            rs = min(0.55, _STITCH_BIG_SCALE)
+            await emit_progress(12, f"RAM habis (OOM) — mencoba ulang pada skala {int(rs*100)}%")
+            n = await asyncio.to_thread(_downscale_dir, stage_dir, scaled_dir, rs)
+            if n >= 2:
+                run_dir, staged = scaled_dir, n
+                note = f" (skala {int(rs*100)}%, setelah OOM)"
+                await emit_progress(14, f"Menjalankan ulang {model_key} — {staged} tile{note}")
+                rc, err_tail, expected = await run_pipeline(run_dir)
+
+        if rc == 0 and os.path.exists(expected):
+            await emit_progress(98, "Mengunggah hasil")
+            local_output = os.path.join(LOCAL_TMP_DIR, "stitched_ta_output.jpg")
+            shutil.copy2(expected, local_output)
+            await asyncio.to_thread(_tag_panorama_scale, local_output, stage_dir, run_dir,
+                                    script_path, model_key)
+            with open(local_output, "rb") as f:
+                enc = base64.b64encode(f.read()).decode("utf-8")
+            try:
+                async with ws_lock:
+                    await websocket.send(json.dumps({
+                        "event": "STITCHING_COMPLETE", "status": "SUCCESS",
+                        "image_data": f"data:image/jpeg;base64,{enc}",
+                        "filename": "stitched_ta_output.jpg",
+                    }))
+                print(f"[BRIDGE AI] Stitching SELESAI{note} ({int(time.time()-t0)}s).")
+            except Exception:
+                pass
+        else:
+            tail = " | ".join(err_tail[-6:])
+            if rc in (-9, 137):
+                detail = (f"RAM Jetson tidak cukup untuk {staged} tile{note} — proses dihentikan OS "
+                          f"(OOM, exit {rc}). Solusi: tutup aplikasi lain / jalankan Jetson headless, "
+                          f"turunkan STITCH_BIG_SCALE, tambah swap, atau pecah pemindaian jadi 2 sesi "
+                          f"lalu jahit kedua mosaiknya.")
+            elif rc is None:
+                detail = (f"Tidak bisa memulai proses stitching (fork gagal, RAM habis): {tail}. "
+                          f"Tutup aplikasi lain di Jetson atau jalankan headless.")
+            elif not os.path.exists(expected):
+                detail = (f"Pipeline {model_key} berakhir (exit {rc}) tanpa menghasilkan mosaik — "
+                          f"kemungkinan overlap antar-tile terlalu kecil."
+                          + (f" Pesan error: {tail}" if tail else ""))
+            else:
+                detail = f"Pipeline {model_key} gagal (exit {rc})." + (f" {tail}" if tail else "")
+            await emit_failed(detail)
+
+    except Exception as e:
+        await emit_failed(f"Kesalahan internal saat stitching: {e}")
+    finally:
+        if paused:
+            await _resume_edge_after_stitch(state)
+
+
+async def handle_ai_action(action: str, data: dict, websocket, ws_lock, state=None):
+    """Router untuk instruksi Computer Vision dan AI"""
+    if action == "START_STITCHING":
+        global _stitch_task
+        if _stitch_task is not None and not _stitch_task.done():
+            try:
+                async with ws_lock:
+                    await websocket.send(json.dumps({
+                        "event": "STITCHING_FAILED", "status": "ERROR",
+                        "detail": "Sudah ada proses tile stitching yang berjalan di Edge.",
+                    }))
+            except Exception:
+                pass
+            return
+        # Jalankan sebagai task background -> receive_handler tetap membaca pesan
+        # (PING dsb.) selama subprocess berjalan bermenit-menit.
+        _stitch_task = asyncio.create_task(_run_stitch_job(data, websocket, ws_lock, state))
+        return
+
+    elif action == "START_DL_COUNT":
+        print(f"[BRIDGE AI] Menjalankan YOLO Segmentation Colony Counter ({os.path.basename(YOLO_SEG_MODEL)})...")
+        target_img = os.path.join(LOCAL_TMP_DIR, "stitched_ta_output.jpg")
+
+        try:
+            result_img, count_result, _ = _run_colony_count(target_img, LOCAL_TMP_DIR)
+        except Exception as e:
+            print(f"[BRIDGE AI ERROR] Colony counting gagal: {e}")
+            async with ws_lock:
+                await websocket.send(json.dumps({"event": "COUNTING_FAILED", "status": "ERROR"}))
+        else:
+            local_predicted_path = os.path.join(LOCAL_TMP_DIR, result_img)
+            with open(local_predicted_path, "rb") as img_file:
+                encoded_predicted = base64.b64encode(img_file.read()).decode('utf-8')
+
+            async with ws_lock:
+                await websocket.send(json.dumps({
+                    "event": "COUNTING_COMPLETE",
+                    "status": "SUCCESS",
+                    "total_cells": count_result,
+                    "image_data": f"data:image/jpeg;base64,{encoded_predicted}",
+                    "filename": result_img
+                }))
+
+    elif action == "APPLY_IMAGE_EDIT":
+        edit_type = data.get("type", "")
+        target_img = os.path.join(LOCAL_TMP_DIR, "stitched_ta_output.jpg")
+        print(f"[BRIDGE CV] Menerapkan filter edit klasik: {edit_type}")
+        params = data.get("params") or {}
+
+        res_file = None
+        if edit_type == "THRESHOLD":
+            res_file = classic_cv_editor.apply_adaptive_threshold(target_img, params)
+        elif edit_type == "BRIGHTNESS":
+            res_file = classic_cv_editor.apply_brightness_contrast(
+                target_img, brightness=data.get("brightness", 0), contrast=data.get("contrast", 0))
+
+        if not res_file:
+            async with ws_lock:
+                await websocket.send(json.dumps({
+                    "event": "EDIT_FAILED", "status": "ERROR",
+                    "detail": f"APPLY_IMAGE_EDIT: tipe '{edit_type}' tak dikenal atau gambar tidak ada.",
+                }))
+        else:
+            local_edited_path = os.path.join(classic_cv_editor.output_dir, res_file)
+            with open(local_edited_path, "rb") as img_file:
+                encoded_edited = base64.b64encode(img_file.read()).decode('utf-8')
+            async with ws_lock:
+                await websocket.send(json.dumps({
+                    "event": "EDIT_COMPLETE",
+                    "status": "SUCCESS",
+                    "image_data": f"data:image/jpeg;base64,{encoded_edited}",
+                    "filename": res_file
+                }))
+
+    elif action in ("CV_COLONY_COUNT", "CV_THRESHOLD", "CV_CONTOUR", "CV_MORPHOLOGY",
+                    "CV_SOBEL", "CV_ROI", "CV_CALIBRATE", "CV_COLOR_SPLIT"):
+        tool = action
+        filename = data.get("filename")
+        params = data.get("params") or {}
+        # Nama file hasil yang HARUS dilaporkan balik ke VPS (backend menunggu
+        # file bernama persis ini di static/uploads). Disuplai backend.
+        report_name = data.get("output_name")
+        print(f"[BRIDGE CV] {tool} pada '{filename}' (params={params}) — DIEKSEKUSI DI JETSON")
+
+        src = _fetch_analysis_input(filename, data.get("image_b64"))
+        if not src or not os.path.exists(src):
+            await _send_cv_failed(websocket, ws_lock, tool,
+                                  f"Gambar input tidak tersedia di Edge: {filename}", report_name)
+            return
+
+        try:
+            out_dir = classic_cv_editor.output_dir
+            extra = None
+
+            if tool in ("CV_COLONY_COUNT", "CV_MORPHOLOGY"):
+                # Kalkulasi Morfologi memakai segmentasi YOLO yang sama dengan colony
+                # counter (luas dari mask, µm/px dari image_scale), bukan Otsu.
+                try:
+                    conf = float(params.get("conf", 0.25))
+                except (TypeError, ValueError):
+                    conf = 0.25
+                try:
+                    ux = float(params["umPerPxX"]) if params.get("umPerPxX") not in (None, "") else None
+                    uy = float(params["umPerPxY"]) if params.get("umPerPxY") not in (None, "") else ux
+                except (TypeError, ValueError):
+                    ux = uy = None
+                out_name, count, cc = await asyncio.to_thread(
+                    _run_colony_count, src, out_dir, conf, (ux, uy) if ux else None)
+                if tool == "CV_COLONY_COUNT":
+                    extra = {"colonies": int(count)}
+                    print(f"[BRIDGE CV] YOLO colony count = {count} (conf={conf})")
+                else:
+                    extra = {"stats": _morphology_stats(cc)}
+                    print(f"[BRIDGE CV] YOLO morphology: {count} koloni, rata-rata luas "
+                          f"{extra['stats']['avg_area']} {extra['stats']['unit']} (conf={conf})")
+                extra.update(_colony_area_payload(cc, report_name or out_name))
+            else:
+                method_name, extra_key = _CV_CLASSIC[tool]
+                method = getattr(classic_cv_editor, method_name)
+                result = await asyncio.to_thread(method, src, params)
+                if extra_key == "stats":
+                    out_name, stats = result
+                    extra = {"stats": stats}
+                else:
+                    out_name = result
+
+            if not out_name:
+                await _send_cv_failed(websocket, ws_lock, tool,
+                                      "Proses CV tidak menghasilkan output (gambar tak terbaca?).", report_name)
+                return
+            out_path = os.path.join(out_dir, out_name)
+            if not os.path.exists(out_path):
+                await _send_cv_failed(websocket, ws_lock, tool, f"File output hilang: {out_name}", report_name)
+                return
+
+            await _send_cv_result(websocket, ws_lock, out_path, report_name or out_name, extra)
+            print(f"[BRIDGE CV] ✅ {tool} selesai -> dilaporkan sbg {report_name or out_name}")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            await _send_cv_failed(websocket, ws_lock, tool, f"{type(e).__name__}: {e}", report_name)
